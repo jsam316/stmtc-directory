@@ -355,7 +355,10 @@
             const [githubRepo, setGithubRepo] = useState('');
             const [newPin, setNewPin] = useState('');
             const [confirmPin, setConfirmPin] = useState('');
+            const [showPhotoIngestion, setShowPhotoIngestion] = useState(false);
+            const [ingestedPhotos, setIngestedPhotos] = useState([]);
             const fileInputRef = useRef(null);
+            const bulkPhotoInputRef = useRef(null);
 
             useEffect(() => {
                 const stored = localStorage.getItem('churchDirectory');
@@ -469,6 +472,79 @@
                     alert('Failed to process photo: ' + error.message);
                     setSyncStatus('');
                 }
+            };
+
+            const handleBulkPhotoFiles = async (files) => {
+                if (!files || files.length === 0) return;
+                setSyncStatus('📸 Processing photos...');
+                const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+                if (imageFiles.length === 0) { alert('No image files found'); setSyncStatus(''); return; }
+
+                const items = [];
+                for (const file of imageFiles) {
+                    try {
+                        const preview = await resizeImage(file);
+                        const nameWithoutExt = file.name.replace(/\.[^.]+$/, '').trim();
+
+                        // Auto-match: try family number first (strip leading zeroes or pad)
+                        let matchedFamilyNo = null;
+                        const byExactNo = families.find(f => f.familyNo === nameWithoutExt);
+                        const byPaddedNo = families.find(f => f.familyNo === nameWithoutExt.padStart(3, '0'));
+                        const byStrippedNo = families.find(f => (f.familyNo || '').replace(/^0+/, '') === nameWithoutExt.replace(/^0+/, ''));
+                        if (byExactNo) matchedFamilyNo = byExactNo.familyNo;
+                        else if (byPaddedNo) matchedFamilyNo = byPaddedNo.familyNo;
+                        else if (byStrippedNo) matchedFamilyNo = byStrippedNo.familyNo;
+                        else {
+                            // Try to match by head of family name (case-insensitive)
+                            const lowerName = nameWithoutExt.toLowerCase();
+                            const byName = families.find(f =>
+                                f.headOfFamily?.toLowerCase().includes(lowerName) ||
+                                lowerName.includes((f.headOfFamily || '').toLowerCase())
+                            );
+                            if (byName) matchedFamilyNo = byName.familyNo;
+                        }
+
+                        items.push({ filename: file.name, preview, matchedFamilyNo });
+                    } catch (err) {
+                        console.error('Failed to process', file.name, err);
+                    }
+                }
+                setIngestedPhotos(items);
+                setSyncStatus('');
+            };
+
+            const handleApplyIngestedPhotos = async () => {
+                const matched = ingestedPhotos.filter(p => p.matchedFamilyNo);
+                if (matched.length === 0) { alert('No photos have a matched family'); return; }
+
+                setSyncStatus(`📸 Applying ${matched.length} photo(s)...`);
+                const updated = [...families];
+                let appliedCount = 0;
+                for (const item of matched) {
+                    const idx = updated.findIndex(f => f.familyNo === item.matchedFamilyNo);
+                    if (idx >= 0) { updated[idx] = { ...updated[idx], photo: item.preview }; appliedCount++; }
+                }
+
+                setFamilies(updated);
+                localStorage.setItem('churchDirectory', JSON.stringify(updated));
+
+                if (githubSync.isConfigured() && password) {
+                    try {
+                        setSyncStatus('☁️ Syncing to GitHub...');
+                        const encrypted = await directoryCrypto.encrypt(updated, password);
+                        await githubSync.uploadData(encrypted, `Bulk photo update - ${appliedCount} photos added`);
+                        setSyncStatus(`✅ Applied ${appliedCount} photo(s) and synced!`);
+                    } catch (error) {
+                        setSyncStatus(`✅ Applied ${appliedCount} photo(s) (GitHub sync failed)`);
+                        console.error('GitHub sync error:', error);
+                    }
+                } else {
+                    setSyncStatus(`✅ Applied ${appliedCount} photo(s) locally!`);
+                }
+
+                setTimeout(() => setSyncStatus(''), 3000);
+                setShowPhotoIngestion(false);
+                setIngestedPhotos([]);
             };
 
             const handleEditFamily = (family) => {
@@ -704,6 +780,13 @@
                                                 🔄
                                             </button>
                                             <button
+                                                onClick={() => setShowPhotoIngestion(true)}
+                                                className="bg-pink-600 text-white px-4 py-3 rounded-xl font-bold hover:bg-pink-700"
+                                                title="Bulk Photo Ingestion"
+                                            >
+                                                📸
+                                            </button>
+                                            <button
                                                 onClick={() => setShowManualImport(true)}
                                                 className="bg-blue-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-blue-700"
                                                 title="Import"
@@ -799,6 +882,142 @@
                                 <p className="text-white/80 text-xl">
                                     {families.length === 0 ? 'No families loaded' : 'No families found'}
                                 </p>
+                            </div>
+                        )}
+
+                        {/* Photo Ingestion Modal */}
+                        {showPhotoIngestion && (
+                            <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+                                <div
+                                    className="bg-white rounded-2xl p-8 max-w-4xl w-full my-8"
+                                    onClick={(e) => e.stopPropagation()}
+                                    onTouchEnd={(e) => e.stopPropagation()}
+                                >
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-2xl font-bold">📸 Bulk Photo Ingestion</h2>
+                                        <button
+                                            onClick={() => { setShowPhotoIngestion(false); setIngestedPhotos([]); }}
+                                            className="text-gray-500 hover:text-gray-700 text-3xl leading-none"
+                                        >×</button>
+                                    </div>
+
+                                    <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 text-sm text-blue-800">
+                                        <strong>Auto-matching:</strong> Files are matched to families by filename. Name files by family number (e.g. <code className="bg-blue-100 px-1 rounded">001.jpg</code>) or by the head of family name (e.g. <code className="bg-blue-100 px-1 rounded">Smith.jpg</code>). You can manually reassign any match below.
+                                    </div>
+
+                                    {/* Drop zone */}
+                                    <div
+                                        className="border-4 border-dashed border-gray-300 rounded-2xl p-12 text-center mb-6 hover:border-purple-400 hover:bg-purple-50 transition-colors cursor-pointer"
+                                        onClick={() => bulkPhotoInputRef.current?.click()}
+                                        onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('border-purple-400', 'bg-purple-50'); }}
+                                        onDragLeave={(e) => { e.currentTarget.classList.remove('border-purple-400', 'bg-purple-50'); }}
+                                        onDrop={async (e) => {
+                                            e.preventDefault();
+                                            e.currentTarget.classList.remove('border-purple-400', 'bg-purple-50');
+                                            await handleBulkPhotoFiles(e.dataTransfer.files);
+                                        }}
+                                    >
+                                        <div className="text-5xl mb-3">📂</div>
+                                        <div className="text-gray-600 font-bold text-lg">Drop photos here or click to select</div>
+                                        <div className="text-gray-400 text-sm mt-1">Multiple image files supported — JPG, PNG, WEBP, etc.</div>
+                                        <input
+                                            ref={bulkPhotoInputRef}
+                                            type="file"
+                                            accept="image/*"
+                                            multiple
+                                            className="hidden"
+                                            onChange={(e) => handleBulkPhotoFiles(e.target.files)}
+                                        />
+                                    </div>
+
+                                    {/* Review table */}
+                                    {ingestedPhotos.length > 0 && (
+                                        <div>
+                                            <div className="flex justify-between items-center mb-3">
+                                                <h3 className="font-bold text-lg">{ingestedPhotos.length} photo(s) loaded — review &amp; confirm matches</h3>
+                                                <span className="text-sm text-gray-500 bg-gray-100 px-3 py-1 rounded-full">
+                                                    {ingestedPhotos.filter(p => p.matchedFamilyNo).length} / {ingestedPhotos.length} matched
+                                                </span>
+                                            </div>
+
+                                            <div className="space-y-2 max-h-96 overflow-y-auto border-2 border-gray-100 rounded-xl p-3">
+                                                {ingestedPhotos.map((item, idx) => (
+                                                    <div key={idx} className="flex items-center gap-4 bg-gray-50 rounded-xl p-3 border border-gray-200">
+                                                        <img
+                                                            src={item.preview}
+                                                            alt={item.filename}
+                                                            className="w-14 h-14 rounded-full object-cover border-2 border-gray-300 flex-shrink-0"
+                                                        />
+                                                        <div className="flex-1 min-w-0">
+                                                            <div className="text-sm font-bold text-gray-800 truncate">{item.filename}</div>
+                                                            {item.matchedFamilyNo
+                                                                ? <div className="text-xs text-green-600 font-semibold mt-0.5">✅ Auto-matched</div>
+                                                                : <div className="text-xs text-orange-500 font-semibold mt-0.5">⚠️ No auto-match — assign manually</div>
+                                                            }
+                                                        </div>
+                                                        <div className="flex-shrink-0 w-52">
+                                                            <select
+                                                                value={item.matchedFamilyNo || ''}
+                                                                onChange={(e) => {
+                                                                    const updated = [...ingestedPhotos];
+                                                                    updated[idx] = { ...updated[idx], matchedFamilyNo: e.target.value || null };
+                                                                    setIngestedPhotos(updated);
+                                                                }}
+                                                                className="w-full px-2 py-2 border border-gray-300 rounded-lg text-sm"
+                                                            >
+                                                                <option value="">-- Unassigned --</option>
+                                                                {[...families].sort((a, b) => (a.familyNo || '').localeCompare(b.familyNo || '')).map(f => (
+                                                                    <option key={f.familyNo} value={f.familyNo}>#{f.familyNo} {f.headOfFamily}</option>
+                                                                ))}
+                                                            </select>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => {
+                                                                const updated = ingestedPhotos.filter((_, i) => i !== idx);
+                                                                setIngestedPhotos(updated);
+                                                            }}
+                                                            className="flex-shrink-0 text-red-400 hover:text-red-600 text-xl leading-none"
+                                                            title="Remove"
+                                                        >×</button>
+                                                    </div>
+                                                ))}
+                                            </div>
+
+                                            <div className="flex gap-3 mt-6">
+                                                <button
+                                                    onClick={handleApplyIngestedPhotos}
+                                                    disabled={!ingestedPhotos.some(p => p.matchedFamilyNo)}
+                                                    className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white py-3 rounded-xl font-bold"
+                                                >
+                                                    ✅ Apply {ingestedPhotos.filter(p => p.matchedFamilyNo).length} Photo(s)
+                                                </button>
+                                                <button
+                                                    onClick={() => setIngestedPhotos([])}
+                                                    className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-6 py-3 rounded-xl font-bold"
+                                                >
+                                                    Clear
+                                                </button>
+                                                <button
+                                                    onClick={() => { setShowPhotoIngestion(false); setIngestedPhotos([]); }}
+                                                    className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-6 py-3 rounded-xl font-bold"
+                                                >
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {ingestedPhotos.length === 0 && (
+                                        <div className="flex justify-end">
+                                            <button
+                                                onClick={() => { setShowPhotoIngestion(false); setIngestedPhotos([]); }}
+                                                className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-6 py-3 rounded-xl font-bold"
+                                            >
+                                                Close
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         )}
 
