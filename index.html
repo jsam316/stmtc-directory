@@ -917,9 +917,14 @@
 
             const filteredFamilies = useMemo(() => {
                 return families.filter(family => {
-                    const matchesSearch = searchTerm === '' || 
-                        family.headOfFamily?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                        family.familyNo?.includes(searchTerm);
+                    const term = searchTerm.toLowerCase();
+                    const matchesSearch = searchTerm === '' ||
+                        family.headOfFamily?.toLowerCase().includes(term) ||
+                        family.familyNo?.includes(searchTerm) ||
+                        family.members?.some(m =>
+                            m.name?.toLowerCase().includes(term) ||
+                            m.petName?.toLowerCase().includes(term)
+                        );
                     const matchesPrayerGroup = selectedPrayerGroup === 'All' || family.prayerGroup === selectedPrayerGroup;
                     return matchesSearch && matchesPrayerGroup;
                 });
