@@ -228,6 +228,29 @@
             }
         }
 
+        // localStorage is only a CACHE — the encrypted file on GitHub is the source of
+        // truth (see loadEncryptedFile). Photos are large base64 blobs, so a directory
+        // with ~100+ photos exceeds the browser's ~5MB localStorage quota. A quota error
+        // must never abort a save, or the GitHub sync that follows it would be skipped
+        // and the change lost. Returns whether the cache write succeeded.
+        function saveLocalCache(families) {
+            try {
+                localStorage.setItem('churchDirectory', JSON.stringify(families));
+                return true;
+            } catch (error) {
+                console.warn('Local cache write failed (storage quota likely exceeded):', error);
+                return false;
+            }
+        }
+
+        // Status text covering every combination of cache write / GitHub publish, so a
+        // silent partial failure can't look like a clean save.
+        function describeSaveResult(cached, published, githubAttempted) {
+            if (published) return cached ? '✅ Saved and published!' : '✅ Published to GitHub (local cache full)';
+            if (githubAttempted) return cached ? '⚠️ Saved locally (GitHub sync failed)' : '⚠️ NOT saved — sync failed and cache is full';
+            return cached ? '✅ Saved locally!' : '⚠️ NOT saved — local storage is full';
+        }
+
         function exportToPDF(families) {
             try {
                 const doc = new jsPDF();
@@ -307,7 +330,7 @@
             }
         }
 
-        function resizeImage(file, maxWidth = 400, maxHeight = 400) {
+        function resizeImage(file, maxWidth = 320, maxHeight = 320) {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 reader.onload = (e) => {
@@ -325,7 +348,9 @@
                         canvas.height = height;
                         const ctx = canvas.getContext('2d');
                         ctx.drawImage(img, 0, 0, width, height);
-                        resolve(canvas.toDataURL('image/jpeg', 0.8));
+                        // 320px @ q0.75 — photos never render above 128px (256px at 2x DPI), so
+                    // this is visually identical while cutting stored size by roughly half.
+                    resolve(canvas.toDataURL('image/jpeg', 0.75));
                     };
                     img.onerror = reject;
                     img.src = e.target.result;
@@ -335,7 +360,7 @@
             });
         }
 
-        function resizeImageFromDataUrl(dataUrl, maxWidth = 400, maxHeight = 400) {
+        function resizeImageFromDataUrl(dataUrl, maxWidth = 320, maxHeight = 320) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.onload = () => {
@@ -348,7 +373,9 @@
                     }
                     canvas.width = width; canvas.height = height;
                     canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-                    resolve(canvas.toDataURL('image/jpeg', 0.8));
+                    // 320px @ q0.75 — photos never render above 128px (256px at 2x DPI), so
+                    // this is visually identical while cutting stored size by roughly half.
+                    resolve(canvas.toDataURL('image/jpeg', 0.75));
                 };
                 img.onerror = reject;
                 img.src = dataUrl;
@@ -375,6 +402,7 @@
             const [showEditFamily, setShowEditFamily] = useState(false);
             const [editingFamily, setEditingFamily] = useState(null);
             const [editingMemberIndex, setEditingMemberIndex] = useState(null);
+            const [editingFamilyIndex, setEditingFamilyIndex] = useState(-1);
             const [syncStatus, setSyncStatus] = useState('');
             const [loadingData, setLoadingData] = useState(false);
             const [githubToken, setGithubToken] = useState('');
@@ -415,8 +443,8 @@
                     setFamilies(decryptedFamilies);
                     setPassword(passwordInput);
                     setIsUnlocked(true);
-                    localStorage.setItem('churchDirectory', JSON.stringify(decryptedFamilies));
-                    localStorage.setItem('directoryPassword', passwordInput);
+                    saveLocalCache(decryptedFamilies);
+                    try { localStorage.setItem('directoryPassword', passwordInput); } catch (e) {}
                     setSyncStatus('✅ Loaded ' + decryptedFamilies.length + ' families!');
                     setTimeout(() => setSyncStatus(''), 3000);
                 } catch (error) {
@@ -441,7 +469,7 @@
                 try {
                     const data = JSON.parse(importJson);
                     setFamilies(data);
-                    localStorage.setItem('churchDirectory', JSON.stringify(data));
+                    saveLocalCache(data);
                     setSyncStatus('✅ Imported ' + data.length + ' families!');
                     setShowManualImport(false);
                     setTimeout(() => setSyncStatus(''), 3000);
@@ -557,20 +585,24 @@
                 }
 
                 setFamilies(updated);
-                localStorage.setItem('churchDirectory', JSON.stringify(updated));
+                const cached = saveLocalCache(updated);
 
-                if (githubSync.isConfigured() && password) {
+                // Sync regardless of the cache result — a full cache must not stop the upload.
+                const attempted = githubSync.isConfigured() && !!password;
+                let published = false;
+                if (attempted) {
                     try {
                         setSyncStatus('☁️ Syncing to GitHub...');
                         const encrypted = await directoryCrypto.encrypt(updated, password);
                         await githubSync.uploadData(encrypted, `Bulk photo update - ${appliedCount} photos added`);
-                        setSyncStatus(`✅ Applied ${appliedCount} photo(s) and synced!`);
+                        published = true;
                     } catch (error) {
-                        setSyncStatus(`✅ Applied ${appliedCount} photo(s) (GitHub sync failed)`);
                         console.error('GitHub sync error:', error);
                     }
-                } else {
-                    setSyncStatus(`✅ Applied ${appliedCount} photo(s) locally!`);
+                }
+                setSyncStatus(`${appliedCount} photo(s) — ${describeSaveResult(cached, published, attempted)}`);
+                if (!cached && !published) {
+                    alert('⚠️ Photos were NOT saved!\n\nThe local cache is full and GitHub sync is unavailable.\n\nUse Export → Encrypted Backup to save your work before reloading.');
                 }
 
                 setTimeout(() => setSyncStatus(''), 3000);
@@ -783,19 +815,25 @@
                     updated[idx] = changed;
                 }
                 setFamilies(updated);
-                localStorage.setItem('churchDirectory', JSON.stringify(updated));
+                const cached = saveLocalCache(updated);
                 const summary = `${photoCount} photo(s)${infoCount > 0 ? ', ' + infoCount + ' info field(s)' : ''}`;
-                if (githubSync.isConfigured() && password) {
+
+                // Sync regardless of the cache result — a full cache must not stop the upload.
+                const attempted = githubSync.isConfigured() && !!password;
+                let published = false;
+                if (attempted) {
                     try {
                         setSyncStatus('☁️ Syncing to GitHub...');
                         const encrypted = await directoryCrypto.encrypt(updated, password);
                         await githubSync.uploadData(encrypted, `PDF import — ${summary} updated`);
-                        setSyncStatus(`✅ Imported ${summary} — synced!`);
+                        published = true;
                     } catch(error) {
-                        setSyncStatus(`✅ Imported ${summary} — saved locally`);
+                        console.error('GitHub sync error:', error);
                     }
-                } else {
-                    setSyncStatus(`✅ Imported ${summary}!`);
+                }
+                setSyncStatus(`${summary} — ${describeSaveResult(cached, published, attempted)}`);
+                if (!cached && !published) {
+                    alert('⚠️ Import was NOT saved!\n\nThe local cache is full and GitHub sync is unavailable.\n\nUse Export → Encrypted Backup to save your work before reloading.');
                 }
                 setTimeout(() => setSyncStatus(''), 4000);
                 setShowPdfIngestion(false);
@@ -803,8 +841,15 @@
             };
 
             const handleEditFamily = (family) => {
-                if (!family.members) family.members = [];
-                setEditingFamily(family);
+                // Capture the position now, while `family` is still the exact object held in
+                // `families` — every edit below replaces it with a copy, so identity is lost.
+                setEditingFamilyIndex(families.indexOf(family));
+                // Edit a copy so Cancel genuinely discards and the stored record is never
+                // mutated in place (which previously bypassed React and skipped re-renders).
+                setEditingFamily({
+                    ...family,
+                    members: (family.members || []).map(m => ({ ...m }))
+                });
                 setShowEditFamily(true);
             };
 
@@ -832,32 +877,42 @@
             const handleSaveFamily = async () => {
                 if (!editingFamily.headOfFamily) { alert('Please enter head of family name'); return; }
                 const updated = [...families];
-                const index = updated.findIndex(f => f.familyNo === editingFamily.familyNo);
-                if (index >= 0) { updated[index] = editingFamily; } else { updated.push(editingFamily); }
-                
+                // Use the index captured when the editor opened. Matching on familyNo here
+                // would write onto the wrong record whenever familyNo is blank or duplicated.
+                if (editingFamilyIndex >= 0 && editingFamilyIndex < updated.length) {
+                    updated[editingFamilyIndex] = editingFamily;
+                } else {
+                    updated.push(editingFamily);
+                }
+
                 setSyncStatus('💾 Saving...');
                 setFamilies(updated);
-                localStorage.setItem('churchDirectory', JSON.stringify(updated));
-                
-                // GitHub Auto-Sync
-                if (githubSync.isConfigured() && password) {
+                const cached = saveLocalCache(updated);
+
+                // GitHub Auto-Sync. Runs regardless of the cache result — GitHub is the
+                // source of truth, so a full local cache must not stop the change being saved.
+                const attempted = githubSync.isConfigured() && !!password;
+                let published = false;
+                if (attempted) {
                     try {
                         setSyncStatus('☁️ Syncing to GitHub...');
                         const encrypted = await directoryCrypto.encrypt(updated, password);
                         await githubSync.uploadData(encrypted);
-                        setSyncStatus('✅ Saved and published!');
+                        published = true;
                     } catch (error) {
-                        setSyncStatus('⚠️ Saved locally (GitHub sync failed)');
                         console.error('GitHub sync error:', error);
                     }
-                } else {
-                    setSyncStatus('✅ Saved locally!');
                 }
-                
-                setTimeout(() => setSyncStatus(''), 2000);
+                setSyncStatus(describeSaveResult(cached, published, attempted));
+                if (!cached && !published) {
+                    alert('⚠️ Could not save!\n\nThe local cache is full and GitHub sync is unavailable, so this change has NOT been stored.\n\nUse Export → Encrypted Backup to save your work before reloading.');
+                }
+
+                setTimeout(() => setSyncStatus(''), 4000);
                 setShowEditFamily(false);
                 setEditingFamily(null);
                 setEditingMemberIndex(null);
+                setEditingFamilyIndex(-1);
             };
 
             const exportEncrypted = async () => {
@@ -1882,7 +1937,7 @@
                                             💾 Save All
                                         </button>
                                         <button
-                                            onClick={() => { setShowEditFamily(false); setEditingFamily(null); setEditingMemberIndex(null); }}
+                                            onClick={() => { setShowEditFamily(false); setEditingFamily(null); setEditingMemberIndex(null); setEditingFamilyIndex(-1); }}
                                             className="flex-1 bg-gray-300 hover:bg-gray-400 text-gray-700 py-3 rounded-xl font-bold"
                                         >
                                             Cancel
