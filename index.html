@@ -826,12 +826,30 @@
                         setTimeout(() => setSyncStatus(''), 2000);
                     } catch (error) {
                         console.error('Token decryption failed:', error);
-                        setSyncStatus('⚠️ Admin access granted - GitHub sync unavailable');
+                        // Fall back to a token saved via the GitHub settings modal, if any —
+                        // signing out clears the in-memory token, so restore it here rather
+                        // than only on page load.
+                        githubSync.loadConfig();
+                        setSyncStatus(githubSync.isConfigured() ? '✅ Admin access granted - GitHub sync ready!' : '⚠️ Admin access granted - GitHub sync unavailable');
                         setTimeout(() => setSyncStatus(''), 3000);
                     }
                 } else {
                     alert('❌ Incorrect PIN');
                 }
+            };
+
+            // Leave admin mode without a reload. Drops the decrypted GitHub token from memory
+            // so a viewer at the same screen cannot publish changes.
+            const handleAdminSignOut = () => {
+                setIsAdmin(false);
+                githubSync.token = null;
+                setShowSettings(false);
+                setShowGitHubSettings(false);
+                setShowExportOptions(false);
+                setShowPhotoIngestion(false);
+                setShowPdfIngestion(false);
+                setSyncStatus('👋 Signed out of admin');
+                setTimeout(() => setSyncStatus(''), 2000);
             };
 
             const handleChangePIN = () => {
@@ -1428,6 +1446,13 @@
                                                 title="Export"
                                             >
                                                 📤
+                                            </button>
+                                            <button
+                                                onClick={handleAdminSignOut}
+                                                className="bg-white/20 text-white px-4 py-3 rounded-xl font-bold hover:bg-white/30"
+                                                title="Sign out of admin"
+                                            >
+                                                🚪 Sign out
                                             </button>
                                         </>
                                     )}
