@@ -842,21 +842,33 @@
                     setShowAdminLogin(false);
                     setAdminPin('');
                     
-                    // Decrypt GitHub token with admin PIN
-                    try {
-                        setSyncStatus('🔐 Decrypting GitHub credentials...');
-                        const decryptedToken = await directoryCrypto.decryptToken(ENCRYPTED_GITHUB_TOKEN, pinManager.getPin());
+                    // Decrypt the embedded GitHub token. The login gate is the admin PIN in
+                    // use on this browser; the token itself was encrypted with the default
+                    // PIN, so try the current PIN first and then the default. Falling back
+                    // weakens nothing — the encrypted token and the default PIN are both in
+                    // the public source — and it means changing the admin PIN no longer
+                    // disables sync.
+                    setSyncStatus('🔐 Decrypting GitHub credentials...');
+                    const candidates = [...new Set([pinManager.getPin(), pinManager.defaultPin])];
+                    let decryptedToken = null;
+                    for (const pin of candidates) {
+                        try { decryptedToken = await directoryCrypto.decryptToken(ENCRYPTED_GITHUB_TOKEN, pin); break; }
+                        catch (error) { /* try the next candidate */ }
+                    }
+                    if (decryptedToken) {
                         githubSync.setDecryptedToken(decryptedToken);
                         setSyncStatus('✅ Admin access granted - GitHub sync ready!');
                         setTimeout(() => setSyncStatus(''), 2000);
-                    } catch (error) {
-                        console.error('Token decryption failed:', error);
+                    } else {
+                        console.error('Token decryption failed with the current and default admin PINs');
                         // Fall back to a token saved via the GitHub settings modal, if any —
                         // signing out clears the in-memory token, so restore it here rather
                         // than only on page load.
                         githubSync.loadConfig();
-                        setSyncStatus(githubSync.isConfigured() ? '✅ Admin access granted - GitHub sync ready!' : '⚠️ Admin access granted - GitHub sync unavailable');
-                        setTimeout(() => setSyncStatus(''), 3000);
+                        setSyncStatus(githubSync.isConfigured()
+                            ? '✅ Admin access granted - GitHub sync ready!'
+                            : '⚠️ Admin access granted - GitHub sync unavailable: built-in token could not be decrypted. Use 🔄 to enter a token.');
+                        setTimeout(() => setSyncStatus(''), 6000);
                     }
                 } else {
                     alert('❌ Incorrect PIN');
@@ -882,14 +894,13 @@
                 if (newPin.length < 4) { alert('PIN must be at least 4 digits'); return; }
                 if (newPin !== confirmPin) { alert('PINs do not match'); return; }
                 
-                // Warn about GitHub sync
-                const confirmed = confirm('⚠️ IMPORTANT: Changing your PIN will disable GitHub auto-sync.\n\nThe GitHub token is encrypted with your current PIN. After changing your PIN, you\'ll need to:\n1. Contact your administrator to get a new version, OR\n2. Manually configure GitHub sync with your own token\n\nContinue with PIN change?');
-                
+                const confirmed = confirm('Change the admin PIN on this browser?\n\nThe new PIN applies to this device only. GitHub auto-sync keeps working.');
                 if (!confirmed) return;
-                
+
+                // The in-memory token stays valid: on the next login the built-in token is
+                // decrypted with the default PIN as a fallback, so sync is not affected.
                 pinManager.setPin(newPin);
-                githubSync.token = null; // Clear the token since it can't be decrypted with new PIN
-                alert('✅ PIN changed successfully!\n\n⚠️ GitHub auto-sync is now disabled. Contact administrator for updated version or configure manually.');
+                alert('✅ PIN changed successfully on this browser.');
                 setNewPin('');
                 setConfirmPin('');
                 setShowSettings(false);
