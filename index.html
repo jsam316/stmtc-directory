@@ -106,7 +106,8 @@
                 combined.set(new Uint8Array(encrypted), salt.byteLength + iv.byteLength);
                 return bytesToBase64(combined);
             }
-            async decrypt(encryptedBase64, password) {
+            // Raw plaintext; use this for values that were not JSON-encoded when encrypted.
+            async decryptText(encryptedBase64, password) {
                 try {
                     const combined = base64ToBytes(encryptedBase64);
                     const salt = combined.slice(0, 16);
@@ -114,10 +115,29 @@
                     const encrypted = combined.slice(28);
                     const key = await this.deriveKey(password, salt);
                     const decrypted = await crypto.subtle.decrypt({name: this.algorithm, iv: iv}, key, encrypted);
-                    return JSON.parse(new TextDecoder().decode(decrypted));
+                    return new TextDecoder().decode(decrypted);
                 } catch (error) {
                     throw new Error('Incorrect password or corrupted data');
                 }
+            }
+            async decrypt(encryptedBase64, password) {
+                const text = await this.decryptText(encryptedBase64, password);
+                try {
+                    return JSON.parse(text);
+                } catch (error) {
+                    throw new Error('Incorrect password or corrupted data');
+                }
+            }
+            // The embedded GitHub token was encrypted as a bare string rather than a JSON
+            // value, so decrypt()'s JSON.parse rejected it and auto-sync silently never
+            // engaged. Accept either encoding.
+            async decryptToken(encryptedBase64, password) {
+                const text = await this.decryptText(encryptedBase64, password);
+                try {
+                    const parsed = JSON.parse(text);
+                    if (typeof parsed === 'string') return parsed;
+                } catch (error) {}
+                return text.trim();
             }
             async loadEncryptedFile() {
                 const paths = ['data/families.json.enc', './data/families.json.enc', 'families.json.enc', './families.json.enc'];
@@ -694,7 +714,7 @@
                 setFamilies(updated);
                 const cached = await saveLocalCache(updated);
                 const attempted = githubSync.isConfigured() && !!password;
-                let published = false;
+                let published = false, syncError = null;
                 if (attempted) {
                     try {
                         setSyncStatus('☁️ Syncing to GitHub...');
@@ -703,12 +723,16 @@
                         published = true;
                     } catch (error) {
                         console.error('GitHub sync error:', error);
+                        syncError = error.message || String(error);
                     }
                 }
                 if (!cached && !published) {
                     alert('⚠️ NOT saved!\n\nThe local cache is full and GitHub sync is unavailable, so this change has not been stored.\n\nUse Export → Encrypted Backup to save your work before reloading.');
                 }
-                return { cached, published, attempted, text: describeSaveResult(cached, published, attempted) };
+                // Surface GitHub's own message (e.g. a token permission problem) rather than
+                // a generic "sync failed" that gives the admin nothing to act on.
+                const text = describeSaveResult(cached, published, attempted) + (syncError ? ` — ${syncError}` : '');
+                return { cached, published, attempted, text };
             };
 
             // Store a photo for a family. With GitHub sync available the photo goes to its own
@@ -821,7 +845,7 @@
                     // Decrypt GitHub token with admin PIN
                     try {
                         setSyncStatus('🔐 Decrypting GitHub credentials...');
-                        const decryptedToken = await directoryCrypto.decrypt(ENCRYPTED_GITHUB_TOKEN, pinManager.getPin());
+                        const decryptedToken = await directoryCrypto.decryptToken(ENCRYPTED_GITHUB_TOKEN, pinManager.getPin());
                         githubSync.setDecryptedToken(decryptedToken);
                         setSyncStatus('✅ Admin access granted - GitHub sync ready!');
                         setTimeout(() => setSyncStatus(''), 2000);
