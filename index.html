@@ -643,6 +643,7 @@
             const [showManualImport, setShowManualImport] = useState(false);
             const [importJson, setImportJson] = useState('');
             const [showSettings, setShowSettings] = useState(false);
+            const [migrateBannerDismissed, setMigrateBannerDismissed] = useState(false);
             const [showGitHubSettings, setShowGitHubSettings] = useState(false);
             const [showExportOptions, setShowExportOptions] = useState(false);
             const [showEditFamily, setShowEditFamily] = useState(false);
@@ -1461,6 +1462,36 @@
                             {syncStatus && (
                                 <div className="mt-4 bg-white/20 rounded-xl p-3 text-white font-bold text-center">
                                     {syncStatus}
+                                </div>
+                            )}
+                            {/* Reminder for admins while legacy inline photos remain in the JSON.
+                                Dismissable for the session only — it should come back until the
+                                migration has actually been run. */}
+                            {isAdmin && inlinePhotoCount > 0 && !migrateBannerDismissed && (
+                                <div className="mt-4 bg-orange-100 border-2 border-orange-300 rounded-xl p-4 flex flex-wrap items-center gap-3" role="status">
+                                    <div className="flex-1 min-w-[16rem] text-orange-900 text-sm">
+                                        <div className="font-bold">📦 {inlinePhotoCount} {inlinePhotoCount === 1 ? 'family still has' : 'families still have'} a legacy inline photo</div>
+                                        <div className="mt-0.5">
+                                            Photos now live in encrypted files. Migrating moves these out of the directory data so it stays small and syncs quickly.
+                                            {!githubSync.isConfigured() && <span className="block mt-1 font-semibold">GitHub sync is unavailable — the migration needs it to upload the photo files.</span>}
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <button
+                                            onClick={migratePhotosToFiles}
+                                            disabled={!githubSync.isConfigured()}
+                                            className="bg-orange-600 hover:bg-orange-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white px-4 py-2 rounded-xl font-bold text-sm"
+                                        >
+                                            📦 Migrate now
+                                        </button>
+                                        <button
+                                            onClick={() => setMigrateBannerDismissed(true)}
+                                            className="bg-white hover:bg-orange-50 text-orange-800 border border-orange-300 px-4 py-2 rounded-xl font-bold text-sm"
+                                            title="Hide until the page is reloaded"
+                                        >
+                                            Later
+                                        </button>
+                                    </div>
                                 </div>
                             )}
                         </div>
