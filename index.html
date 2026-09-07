@@ -63,6 +63,25 @@
         // - Regular users with directory password CANNOT access GitHub
         // - Perfect privilege separation: View vs Edit
         
+        // Base64 <-> bytes without spreading the whole buffer into one call.
+        // `String.fromCharCode(...bytes)` throws RangeError past ~100KB of arguments, and
+        // the directory JSON is already ~600KB, so the spread form broke every encrypt()
+        // once the payload grew — silently, because the sync `try` swallowed it.
+        function bytesToBase64(bytes) {
+            let binary = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+            }
+            return btoa(binary);
+        }
+        function base64ToBytes(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
+        }
+
         // ENCRYPTION
         class DirectoryCrypto {
             constructor() {
@@ -85,11 +104,11 @@
                 combined.set(salt, 0);
                 combined.set(iv, salt.byteLength);
                 combined.set(new Uint8Array(encrypted), salt.byteLength + iv.byteLength);
-                return btoa(String.fromCharCode(...combined));
+                return bytesToBase64(combined);
             }
             async decrypt(encryptedBase64, password) {
                 try {
-                    const combined = new Uint8Array(atob(encryptedBase64).split('').map(c => c.charCodeAt(0)));
+                    const combined = base64ToBytes(encryptedBase64);
                     const salt = combined.slice(0, 16);
                     const iv = combined.slice(16, 28);
                     const encrypted = combined.slice(28);
@@ -112,6 +131,88 @@
             }
         }
         const directoryCrypto = new DirectoryCrypto();
+
+        // PHOTO ENCRYPTION
+        // Photos live as individual files, photos/<key>.enc, so they stay out of the
+        // families JSON (which otherwise bloats the cache, the unlock decrypt and every
+        // sync). GitHub Pages serves the repo publicly, so each file is encrypted with the
+        // directory PIN — the same trust boundary as families.json.enc.
+        //
+        // Unlike DirectoryCrypto, the AES key is derived ONCE per session and reused:
+        // PBKDF2 at 100k iterations costs ~100-300ms, fine for one JSON file but minutes
+        // for a grid of hundreds of photos. A fixed salt is acceptable here — brute-force
+        // resistance is bounded by the PIN's entropy either way — and every file still
+        // gets its own random IV.
+        // File format: base64( iv[12] ‖ AES-GCM( utf8(data-URL) ) )
+        const PHOTO_KEY_SALT = 'stmtc-directory-photos-v1';
+        class PhotoCrypto {
+            constructor() { this.key = null; this.password = null; this.waiters = []; }
+            async init(password) {
+                if (!password || (this.key && this.password === password)) return;
+                const encoder = new TextEncoder();
+                const base = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+                this.key = await crypto.subtle.deriveKey(
+                    { name: 'PBKDF2', salt: encoder.encode(PHOTO_KEY_SALT), iterations: 100000, hash: 'SHA-256' },
+                    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+                this.password = password;
+                const waiting = this.waiters;
+                this.waiters = [];
+                waiting.forEach(resolve => resolve());
+            }
+            ready() { return !!this.key; }
+            // Key derivation runs asynchronously right after unlock, while the first cards
+            // are already asking for photos; callers wait here rather than giving up.
+            whenReady() { return this.key ? Promise.resolve() : new Promise(resolve => this.waiters.push(resolve)); }
+            async encrypt(dataUrl) {
+                if (!this.key) throw new Error('Photo key not initialised');
+                const iv = crypto.getRandomValues(new Uint8Array(12));
+                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.key, new TextEncoder().encode(dataUrl));
+                const out = new Uint8Array(12 + ct.byteLength);
+                out.set(iv, 0);
+                out.set(new Uint8Array(ct), 12);
+                return bytesToBase64(out);
+            }
+            async decrypt(base64) {
+                if (!this.key) throw new Error('Photo key not initialised');
+                const bytes = base64ToBytes(base64);
+                const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12) }, this.key, bytes.subarray(12));
+                return new TextDecoder().decode(pt);
+            }
+        }
+        const photoCrypto = new PhotoCrypto();
+
+        // IndexedDB key/value cache. Replaces localStorage for the families cache and holds
+        // decrypted photos: its quota is hundreds of MB rather than ~5MB.
+        class IdbCache {
+            constructor() { this.dbPromise = null; }
+            open() {
+                if (!this.dbPromise) {
+                    this.dbPromise = new Promise((resolve, reject) => {
+                        try {
+                            const req = indexedDB.open('stmtc-directory', 1);
+                            req.onupgradeneeded = () => req.result.createObjectStore('kv');
+                            req.onsuccess = () => resolve(req.result);
+                            req.onerror = () => reject(req.error);
+                        } catch (e) { reject(e); }
+                    });
+                    this.dbPromise.catch(() => { this.dbPromise = null; });
+                }
+                return this.dbPromise;
+            }
+            async run(mode, op) {
+                const db = await this.open();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction('kv', mode);
+                    const req = op(tx.objectStore('kv'));
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+            }
+            get(key) { return this.run('readonly', s => s.get(key)); }
+            set(key, value) { return this.run('readwrite', s => s.put(value, key)); }
+            del(key) { return this.run('readwrite', s => s.delete(key)); }
+        }
+        const idbCache = new IdbCache();
 
         // PDF.js worker
         if (window.pdfjsLib) {
@@ -161,44 +262,123 @@
                 if (!response.ok) throw new Error(response.status === 401 ? 'Invalid token' : 'Repository not found');
                 return await response.json();
             }
-            async getFileSHA() {
+            headers(extra = {}) {
+                return { 'Authorization': `token ${this.token}`, 'Accept': 'application/vnd.github.v3+json', ...extra };
+            }
+            async getFileSHA(path = this.filePath) {
                 try {
-                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${this.filePath}?ref=${this.branch}`, {
-                        headers: { 'Authorization': `token ${this.token}`, 'Accept': 'application/vnd.github.v3+json' }
-                    });
-                    if (response.ok) {
-                        const data = await response.json();
-                        return data.sha;
-                    }
+                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}?ref=${this.branch}`, { headers: this.headers() });
+                    if (response.ok) return (await response.json()).sha;
                     return null;
                 } catch (error) { return null; }
             }
-            async uploadData(encryptedData, commitMessage = null) {
+            // Create or update one file; `textContent` is written verbatim as the file body.
+            async uploadFile(path, textContent, commitMessage) {
                 if (!this.isConfigured()) throw new Error('GitHub not configured');
-                const sha = await this.getFileSHA();
-                if (!commitMessage) {
-                    const now = new Date();
-                    commitMessage = `Updated directory - ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
-                }
-                const body = { message: commitMessage, content: btoa(encryptedData), branch: this.branch };
+                const sha = await this.getFileSHA(path);
+                const body = { message: commitMessage, content: btoa(textContent), branch: this.branch };
                 if (sha) body.sha = sha;
-                const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${this.filePath}`, {
+                const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
                     method: 'PUT',
-                    headers: {
-                        'Authorization': `token ${this.token}`,
-                        'Accept': 'application/vnd.github.v3+json',
-                        'Content-Type': 'application/json'
-                    },
+                    headers: this.headers({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(body)
                 });
                 if (!response.ok) {
-                    const error = await response.json();
+                    const error = await response.json().catch(() => ({}));
                     throw new Error(error.message || 'Upload failed');
                 }
                 return await response.json();
             }
+            async deleteFile(path, commitMessage) {
+                if (!this.isConfigured()) throw new Error('GitHub not configured');
+                const sha = await this.getFileSHA(path);
+                if (!sha) return null; // already gone
+                const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
+                    method: 'DELETE',
+                    headers: this.headers({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({ message: commitMessage, sha, branch: this.branch })
+                });
+                if (!response.ok) {
+                    const error = await response.json().catch(() => ({}));
+                    throw new Error(error.message || 'Delete failed');
+                }
+                return await response.json();
+            }
+            async uploadData(encryptedData, commitMessage = null) {
+                if (!commitMessage) {
+                    const now = new Date();
+                    commitMessage = `Updated directory - ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
+                }
+                return this.uploadFile(this.filePath, encryptedData, commitMessage);
+            }
         }
         const githubSync = new GitHubSync();
+
+        // PHOTO STORE — fetch, decrypt and cache photos/<key>.enc; upload new ones.
+        function photoKeyFor(family) {
+            const fromNo = String(family.familyNo || '').trim().replace(/[^A-Za-z0-9_-]/g, '_');
+            if (fromNo) return fromNo;
+            // Blank familyNo: mint a random key; it is persisted on the record.
+            const rnd = crypto.getRandomValues(new Uint32Array(2));
+            return 'f' + rnd[0].toString(16) + rnd[1].toString(16);
+        }
+        function hasPhoto(family) {
+            return !!(family && (family.photo || family.photoKey || family._pendingPhoto));
+        }
+        class PhotoStore {
+            constructor() { this.memory = new Map(); this.pending = new Map(); }
+            path(key) { return `photos/${key}.enc`; }
+            cacheId(key, version) { return `${key}@${version || 0}`; }
+            peek(key, version) { return key ? (this.memory.get(this.cacheId(key, version)) || null) : null; }
+            remember(key, version, dataUrl) {
+                const id = this.cacheId(key, version);
+                this.memory.set(id, dataUrl);
+                idbCache.set('photo:' + id, dataUrl).catch(() => {});
+            }
+            forget(key) {
+                for (const id of [...this.memory.keys()]) if (id.startsWith(key + '@')) this.memory.delete(id);
+            }
+            // Resolves to a data URL, or null if the file is missing or undecryptable.
+            // Concurrent callers for the same photo share one in-flight request.
+            load(key, version) {
+                if (!key) return Promise.resolve(null);
+                const id = this.cacheId(key, version);
+                if (this.memory.has(id)) return Promise.resolve(this.memory.get(id));
+                if (this.pending.has(id)) return this.pending.get(id);
+                const task = (async () => {
+                    try {
+                        const cached = await idbCache.get('photo:' + id).catch(() => null);
+                        if (cached) { this.memory.set(id, cached); return cached; }
+                        await photoCrypto.whenReady();
+                        // `v` is ignored by the static host; it only busts the browser cache
+                        // after a photo is replaced.
+                        const res = await fetch(`${this.path(key)}?v=${version || 0}`);
+                        if (!res.ok) return null;
+                        const dataUrl = await photoCrypto.decrypt((await res.text()).trim());
+                        this.remember(key, version, dataUrl);
+                        return dataUrl;
+                    } catch (error) {
+                        console.warn('Photo load failed for', key, error);
+                        return null;
+                    } finally {
+                        this.pending.delete(id);
+                    }
+                })();
+                this.pending.set(id, task);
+                return task;
+            }
+            async upload(key, version, dataUrl) {
+                const encrypted = await photoCrypto.encrypt(dataUrl);
+                await githubSync.uploadFile(this.path(key), encrypted, `Update photo ${key}`);
+                this.forget(key);
+                this.remember(key, version, dataUrl);
+            }
+            async remove(key) {
+                this.forget(key);
+                await githubSync.deleteFile(this.path(key), `Remove photo ${key}`);
+            }
+        }
+        const photoStore = new PhotoStore();
 
         // PIN MANAGER
         class PinManager {
@@ -228,19 +408,40 @@
             }
         }
 
-        // localStorage is only a CACHE — the encrypted file on GitHub is the source of
-        // truth (see loadEncryptedFile). Photos are large base64 blobs, so a directory
-        // with ~100+ photos exceeds the browser's ~5MB localStorage quota. A quota error
-        // must never abort a save, or the GitHub sync that follows it would be skipped
-        // and the change lost. Returns whether the cache write succeeded.
-        function saveLocalCache(families) {
+        // The local cache is only a CACHE — the encrypted file on GitHub is the source of
+        // truth (see loadEncryptedFile) — so a failed write must never abort a save, or the
+        // GitHub sync that follows would be skipped and the change lost.
+        // IndexedDB is tried first (quota in the hundreds of MB); localStorage (~5MB) is the
+        // fallback for browsers that block IndexedDB. Resolves to whether any write succeeded.
+        const CACHE_KEY = 'churchDirectory';
+        async function saveLocalCache(families) {
             try {
-                localStorage.setItem('churchDirectory', JSON.stringify(families));
+                await idbCache.set(CACHE_KEY, families);
+                try { localStorage.removeItem(CACHE_KEY); } catch (e) {} // release the old quota
                 return true;
-            } catch (error) {
-                console.warn('Local cache write failed (storage quota likely exceeded):', error);
-                return false;
+            } catch (idbError) {
+                console.warn('IndexedDB cache write failed, trying localStorage:', idbError);
+                try {
+                    localStorage.setItem(CACHE_KEY, JSON.stringify(families));
+                    return true;
+                } catch (lsError) {
+                    console.warn('Local cache write failed (storage quota likely exceeded):', lsError);
+                    return false;
+                }
             }
+        }
+        // IndexedDB first, then the legacy localStorage entry (migrated forward on the next
+        // save). Resolves to an array or null.
+        async function loadLocalCache() {
+            try {
+                const fromIdb = await idbCache.get(CACHE_KEY);
+                if (Array.isArray(fromIdb)) return fromIdb;
+            } catch (e) {}
+            try {
+                const legacy = localStorage.getItem(CACHE_KEY);
+                if (legacy) return JSON.parse(legacy);
+            } catch (e) {}
+            return null;
         }
 
         // Status text covering every combination of cache write / GitHub publish, so a
@@ -382,6 +583,51 @@
             });
         }
 
+        // Becomes true once the element scrolls near the viewport, and stays true.
+        function useInView(ref) {
+            const [inView, setInView] = useState(false);
+            useEffect(() => {
+                if (inView || !ref.current) return;
+                if (!('IntersectionObserver' in window)) { setInView(true); return; }
+                const observer = new IntersectionObserver((entries) => {
+                    if (entries.some(e => e.isIntersecting)) { setInView(true); observer.disconnect(); }
+                }, { rootMargin: '200px' });
+                observer.observe(ref.current);
+                return () => observer.disconnect();
+            }, [ref, inView]);
+            return inView;
+        }
+
+        // Resolves a family's photo to a data URL: an unsaved upload first, then a legacy
+        // inline photo, then the encrypted file (fetched lazily once `active`).
+        function usePhoto(family, active) {
+            const inline = family._pendingPhoto || family.photo || null;
+            const key = family.photoKey, version = family.photoUpdated;
+            const [src, setSrc] = useState(() => inline || photoStore.peek(key, version));
+            useEffect(() => {
+                if (inline) { setSrc(inline); return; }
+                if (!key) { setSrc(null); return; }
+                const cached = photoStore.peek(key, version);
+                if (cached) { setSrc(cached); return; }
+                setSrc(null);
+                if (!active) return;
+                let alive = true;
+                photoStore.load(key, version).then(url => { if (alive) setSrc(url); });
+                return () => { alive = false; };
+            }, [inline, key, version, active]);
+            return src;
+        }
+
+        // Family photo with lazy loading. Shows `fallback` in a placeholder until there is
+        // something to render.
+        function FamilyPhoto({ family, className, placeholderClassName, fallback, alt }) {
+            const ref = useRef(null);
+            const visible = useInView(ref);
+            const src = usePhoto(family, visible);
+            if (src) return <img ref={ref} src={src} alt={alt || family.headOfFamily || ''} className={className} />;
+            return <div ref={ref} className={placeholderClassName}>{fallback}</div>;
+        }
+
         // MAIN APP
         function ChurchDirectory() {
             const [isUnlocked, setIsUnlocked] = useState(false);
@@ -420,17 +666,106 @@
             const pdfInputRef = useRef(null);
 
             useEffect(() => {
-                const stored = localStorage.getItem('churchDirectory');
-                const storedPassword = localStorage.getItem('directoryPassword');
-                if (stored && storedPassword) {
-                    try {
-                        const data = JSON.parse(stored);
-                        setFamilies(data);
-                        setPassword(storedPassword);
-                        setPasswordInput(storedPassword);
-                    } catch (error) { console.error('Failed to load stored data:', error); }
-                }
+                let cancelled = false;
+                (async () => {
+                    let storedPassword = null;
+                    try { storedPassword = localStorage.getItem('directoryPassword'); } catch (e) {}
+                    if (!storedPassword) return;
+                    const data = await loadLocalCache();
+                    if (cancelled || !Array.isArray(data)) return;
+                    setFamilies(data);
+                    setPassword(storedPassword);
+                    setPasswordInput(storedPassword);
+                })();
+                return () => { cancelled = true; };
             }, []);
+
+            // Derive the photo key once per PIN so cards can decrypt photos on demand.
+            useEffect(() => {
+                if (password) photoCrypto.init(password).catch(e => console.error('Photo key init failed:', e));
+            }, [password]);
+
+            // Commit a new families array: update state, write the local cache, sync to
+            // GitHub. The sync runs regardless of the cache result — GitHub is the source of
+            // truth, so a full cache must never stop the change being saved. Returns the
+            // outcome so callers can word their status line.
+            const persistFamilies = async (updated, commitMessage) => {
+                setFamilies(updated);
+                const cached = await saveLocalCache(updated);
+                const attempted = githubSync.isConfigured() && !!password;
+                let published = false;
+                if (attempted) {
+                    try {
+                        setSyncStatus('☁️ Syncing to GitHub...');
+                        const encrypted = await directoryCrypto.encrypt(updated, password);
+                        await githubSync.uploadData(encrypted, commitMessage);
+                        published = true;
+                    } catch (error) {
+                        console.error('GitHub sync error:', error);
+                    }
+                }
+                if (!cached && !published) {
+                    alert('⚠️ NOT saved!\n\nThe local cache is full and GitHub sync is unavailable, so this change has not been stored.\n\nUse Export → Encrypted Backup to save your work before reloading.');
+                }
+                return { cached, published, attempted, text: describeSaveResult(cached, published, attempted) };
+            };
+
+            // Store a photo for a family. With GitHub sync available the photo goes to its own
+            // encrypted file and the record keeps only a key; otherwise (local-only mode, or an
+            // upload failure) it is kept inline so nothing is lost. Returns the updated record
+            // and which of those happened.
+            const attachPhoto = async (family, dataUrl) => {
+                const fam = { ...family };
+                if (githubSync.isConfigured() && password) {
+                    const key = fam.photoKey || photoKeyFor(fam);
+                    const version = Date.now();
+                    try {
+                        await photoCrypto.init(password);
+                        await photoStore.upload(key, version, dataUrl);
+                        fam.photoKey = key;
+                        fam.photoUpdated = version;
+                        delete fam.photo;
+                        return { family: fam, mode: 'file' };
+                    } catch (error) {
+                        console.error('Photo upload failed for', key, error);
+                        fam.photo = dataUrl;
+                        return { family: fam, mode: 'fallback' };
+                    }
+                }
+                fam.photo = dataUrl;
+                return { family: fam, mode: 'inline' };
+            };
+            const describePhotoModes = (modes) => {
+                const n = m => modes.filter(x => x === m).length;
+                const parts = [];
+                if (n('file')) parts.push(`${n('file')} to encrypted file(s)`);
+                if (n('inline')) parts.push(`${n('inline')} inline (GitHub sync off)`);
+                if (n('fallback')) parts.push(`${n('fallback')} inline (upload failed)`);
+                return parts.join(', ');
+            };
+
+            // One-time move of legacy inline photos into encrypted files, so the families
+            // JSON shrinks back to text. Safe to re-run: records without an inline photo are
+            // skipped, and a record only loses its inline copy once its file upload succeeded.
+            const inlinePhotoCount = useMemo(() => families.filter(f => f.photo).length, [families]);
+            const migratePhotosToFiles = async () => {
+                if (!githubSync.isConfigured() || !password) { alert('GitHub sync must be available (log in as admin) to migrate photos.'); return; }
+                const todo = families.map((f, i) => f.photo ? i : -1).filter(i => i >= 0);
+                if (todo.length === 0) { alert('No inline photos to migrate.'); return; }
+                if (!confirm(`Move ${todo.length} photo(s) into encrypted files?\n\nEach photo becomes one commit; this may take a minute.`)) return;
+                const updated = [...families];
+                let moved = 0, failed = 0;
+                for (let n = 0; n < todo.length; n++) {
+                    const i = todo[n];
+                    setSyncStatus(`📦 Migrating photo ${n + 1} of ${todo.length}...`);
+                    const { family, mode } = await attachPhoto(updated[i], updated[i].photo);
+                    if (mode === 'file') { updated[i] = family; moved++; } else { failed++; }
+                }
+                const result = await persistFamilies(updated, `Migrate ${moved} photos to encrypted files`);
+                setSyncStatus(`📦 Migrated ${moved} photo(s)${failed ? `, ${failed} failed` : ''} — ${result.text}`);
+                setTimeout(() => setSyncStatus(''), 6000);
+                setShowSettings(false);
+            };
 
             const handleUnlock = async () => {
                 if (!passwordInput) { alert('Please enter your Directory PIN'); return; }
@@ -524,7 +859,7 @@
                 try {
                     setSyncStatus('📸 Processing photo...');
                     const resizedPhoto = await resizeImage(file);
-                    setEditingFamily({...editingFamily, photo: resizedPhoto});
+                    setEditingFamily({...editingFamily, _pendingPhoto: resizedPhoto, _removePhoto: false});
                     setSyncStatus('✅ Photo added!');
                     setTimeout(() => setSyncStatus(''), 2000);
                 } catch (error) {
@@ -576,36 +911,21 @@
                 const matched = ingestedPhotos.filter(p => p.matchedFamilyNo);
                 if (matched.length === 0) { alert('No photos have a matched family'); return; }
 
-                setSyncStatus(`📸 Applying ${matched.length} photo(s)...`);
                 const updated = [...families];
-                let appliedCount = 0;
-                for (const item of matched) {
+                const modes = [];
+                for (let i = 0; i < matched.length; i++) {
+                    const item = matched[i];
                     const idx = updated.findIndex(f => f.familyNo === item.matchedFamilyNo);
-                    if (idx >= 0) { updated[idx] = { ...updated[idx], photo: item.preview }; appliedCount++; }
+                    if (idx < 0) continue;
+                    setSyncStatus(`📸 Storing photo ${i + 1} of ${matched.length}...`);
+                    const { family, mode } = await attachPhoto(updated[idx], item.preview);
+                    updated[idx] = family;
+                    modes.push(mode);
                 }
 
-                setFamilies(updated);
-                const cached = saveLocalCache(updated);
-
-                // Sync regardless of the cache result — a full cache must not stop the upload.
-                const attempted = githubSync.isConfigured() && !!password;
-                let published = false;
-                if (attempted) {
-                    try {
-                        setSyncStatus('☁️ Syncing to GitHub...');
-                        const encrypted = await directoryCrypto.encrypt(updated, password);
-                        await githubSync.uploadData(encrypted, `Bulk photo update - ${appliedCount} photos added`);
-                        published = true;
-                    } catch (error) {
-                        console.error('GitHub sync error:', error);
-                    }
-                }
-                setSyncStatus(`${appliedCount} photo(s) — ${describeSaveResult(cached, published, attempted)}`);
-                if (!cached && !published) {
-                    alert('⚠️ Photos were NOT saved!\n\nThe local cache is full and GitHub sync is unavailable.\n\nUse Export → Encrypted Backup to save your work before reloading.');
-                }
-
-                setTimeout(() => setSyncStatus(''), 3000);
+                const result = await persistFamilies(updated, `Bulk photo update - ${modes.length} photos`);
+                setSyncStatus(`${modes.length} photo(s): ${describePhotoModes(modes)} — ${result.text}`);
+                setTimeout(() => setSyncStatus(''), 5000);
                 setShowPhotoIngestion(false);
                 setIngestedPhotos([]);
             };
@@ -791,6 +1111,7 @@
                 setSyncStatus(`📥 Importing ${matched.length} page(s) from PDF...`);
                 const updated = [...families];
                 let photoCount = 0, infoCount = 0;
+                const modes = [];
                 for (const item of matched) {
                     const idx = updated.findIndex(f => f.familyNo === item.matchedFamilyNo);
                     if (idx < 0) continue;
@@ -799,9 +1120,13 @@
                     // Apply photo (embedded preferred, else full-page render)
                     try {
                         const src = (item.useEmbedded && item.embeddedImages.length > 0) ? item.embeddedImages[0] : item.pageRender;
-                        changed.photo = await resizeImageFromDataUrl(src);
+                        const resized = await resizeImageFromDataUrl(src);
+                        setSyncStatus(`📸 Storing photo for #${item.matchedFamilyNo}...`);
+                        const { family, mode } = await attachPhoto(changed, resized);
+                        changed = family;
+                        modes.push(mode);
                         photoCount++;
-                    } catch(e) { console.error('Photo resize failed for', item.matchedFamilyNo, e); }
+                    } catch(e) { console.error('Photo import failed for', item.matchedFamilyNo, e); }
 
                     // Apply parsed info fields (only overwrite if the PDF had a value)
                     const d = item.parsedData || {};
@@ -814,28 +1139,10 @@
 
                     updated[idx] = changed;
                 }
-                setFamilies(updated);
-                const cached = saveLocalCache(updated);
                 const summary = `${photoCount} photo(s)${infoCount > 0 ? ', ' + infoCount + ' info field(s)' : ''}`;
-
-                // Sync regardless of the cache result — a full cache must not stop the upload.
-                const attempted = githubSync.isConfigured() && !!password;
-                let published = false;
-                if (attempted) {
-                    try {
-                        setSyncStatus('☁️ Syncing to GitHub...');
-                        const encrypted = await directoryCrypto.encrypt(updated, password);
-                        await githubSync.uploadData(encrypted, `PDF import — ${summary} updated`);
-                        published = true;
-                    } catch(error) {
-                        console.error('GitHub sync error:', error);
-                    }
-                }
-                setSyncStatus(`${summary} — ${describeSaveResult(cached, published, attempted)}`);
-                if (!cached && !published) {
-                    alert('⚠️ Import was NOT saved!\n\nThe local cache is full and GitHub sync is unavailable.\n\nUse Export → Encrypted Backup to save your work before reloading.');
-                }
-                setTimeout(() => setSyncStatus(''), 4000);
+                const result = await persistFamilies(updated, `PDF import — ${summary} updated`);
+                setSyncStatus(`${summary}${modes.length ? ' (' + describePhotoModes(modes) + ')' : ''} — ${result.text}`);
+                setTimeout(() => setSyncStatus(''), 5000);
                 setShowPdfIngestion(false);
                 setPdfPageItems([]);
             };
@@ -876,37 +1183,37 @@
 
             const handleSaveFamily = async () => {
                 if (!editingFamily.headOfFamily) { alert('Please enter head of family name'); return; }
+                setSyncStatus('💾 Saving...');
+
+                // Resolve the photo first: upload a new one to its encrypted file, or drop it.
+                let fam = { ...editingFamily };
+                const pendingPhoto = fam._pendingPhoto, removePhoto = fam._removePhoto;
+                delete fam._pendingPhoto;
+                delete fam._removePhoto;
+                let photoNote = '';
+                if (pendingPhoto) {
+                    setSyncStatus('📸 Uploading photo...');
+                    const { family, mode } = await attachPhoto(fam, pendingPhoto);
+                    fam = family;
+                    if (mode === 'fallback') photoNote = ' (photo kept inline — file upload failed)';
+                } else if (removePhoto) {
+                    const oldKey = fam.photoKey;
+                    delete fam.photo;
+                    delete fam.photoKey;
+                    delete fam.photoUpdated;
+                    if (oldKey && githubSync.isConfigured()) photoStore.remove(oldKey).catch(e => console.warn('Photo file delete failed:', e));
+                }
+
                 const updated = [...families];
                 // Use the index captured when the editor opened. Matching on familyNo here
                 // would write onto the wrong record whenever familyNo is blank or duplicated.
                 if (editingFamilyIndex >= 0 && editingFamilyIndex < updated.length) {
-                    updated[editingFamilyIndex] = editingFamily;
+                    updated[editingFamilyIndex] = fam;
                 } else {
-                    updated.push(editingFamily);
+                    updated.push(fam);
                 }
-
-                setSyncStatus('💾 Saving...');
-                setFamilies(updated);
-                const cached = saveLocalCache(updated);
-
-                // GitHub Auto-Sync. Runs regardless of the cache result — GitHub is the
-                // source of truth, so a full local cache must not stop the change being saved.
-                const attempted = githubSync.isConfigured() && !!password;
-                let published = false;
-                if (attempted) {
-                    try {
-                        setSyncStatus('☁️ Syncing to GitHub...');
-                        const encrypted = await directoryCrypto.encrypt(updated, password);
-                        await githubSync.uploadData(encrypted);
-                        published = true;
-                    } catch (error) {
-                        console.error('GitHub sync error:', error);
-                    }
-                }
-                setSyncStatus(describeSaveResult(cached, published, attempted));
-                if (!cached && !published) {
-                    alert('⚠️ Could not save!\n\nThe local cache is full and GitHub sync is unavailable, so this change has NOT been stored.\n\nUse Export → Encrypted Backup to save your work before reloading.');
-                }
+                const result = await persistFamilies(updated);
+                setSyncStatus(result.text + photoNote);
 
                 setTimeout(() => setSyncStatus(''), 4000);
                 setShowEditFamily(false);
@@ -1162,17 +1469,12 @@
                                     className="glass-effect rounded-2xl p-6 shadow-xl hover:shadow-2xl transition-all cursor-pointer transform hover:scale-105"
                                 >
                                     <div className="flex gap-4 mb-3">
-                                        {family.photo ? (
-                                            <img
-                                                src={family.photo}
-                                                alt={family.headOfFamily}
-                                                className="w-16 h-16 rounded-full object-cover border-2 border-white"
-                                            />
-                                        ) : (
-                                            <div className="w-16 h-16 rounded-full bg-purple-500/50 flex items-center justify-center text-white text-2xl font-bold">
-                                                {family.headOfFamily?.charAt(0) || '?'}
-                                            </div>
-                                        )}
+                                        <FamilyPhoto
+                                            family={family}
+                                            className="w-16 h-16 rounded-full object-cover border-2 border-white"
+                                            placeholderClassName="w-16 h-16 rounded-full bg-purple-500/50 flex items-center justify-center text-white text-2xl font-bold"
+                                            fallback={family.headOfFamily?.charAt(0) || '?'}
+                                        />
                                         <div className="flex-1">
                                             <div className="text-purple-200 text-sm font-bold">#{family.familyNo}</div>
                                             <h3 className="text-white text-xl font-bold mt-1">{family.headOfFamily}</h3>
@@ -1727,6 +2029,21 @@
                                             Update PIN
                                         </button>
                                     </div>
+                                    <h3 className="text-lg font-bold mb-2">Photo Storage</h3>
+                                    <p className="text-sm text-gray-600 mb-3">
+                                        Photos are kept as individually encrypted files (<code className="bg-gray-100 px-1 rounded">photos/…enc</code>) so the directory data stays small.
+                                        {inlinePhotoCount > 0
+                                            ? <span className="block mt-1 text-orange-700 font-semibold">⚠️ {inlinePhotoCount} {inlinePhotoCount === 1 ? 'family still has' : 'families still have'} a legacy inline photo.</span>
+                                            : <span className="block mt-1 text-green-700 font-semibold">✅ No legacy inline photos.</span>}
+                                    </p>
+                                    <button
+                                        onClick={migratePhotosToFiles}
+                                        disabled={inlinePhotoCount === 0 || !githubSync.isConfigured()}
+                                        title={!githubSync.isConfigured() ? 'GitHub sync must be available' : ''}
+                                        className="w-full mb-6 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white py-3 rounded-xl font-bold"
+                                    >
+                                        📦 Migrate {inlinePhotoCount > 0 ? inlinePhotoCount + ' ' : ''}photo(s) to encrypted files
+                                    </button>
                                     <button
                                         onClick={() => { setShowSettings(false); setNewPin(''); setConfirmPin(''); }}
                                         className="w-full bg-gray-300 hover:bg-gray-400 text-gray-700 py-3 rounded-xl font-bold"
@@ -1750,8 +2067,16 @@
                                     <div className="mb-6">
                                         <label className="block text-sm font-bold mb-2">Family Photo</label>
                                         <div className="flex items-center gap-4">
-                                            {editingFamily.photo ? (
-                                                <img src={editingFamily.photo} alt="Family" className="w-24 h-24 rounded-full object-cover" />
+                                            {editingFamily._pendingPhoto ? (
+                                                <img src={editingFamily._pendingPhoto} alt="Family" className="w-24 h-24 rounded-full object-cover" />
+                                            ) : (hasPhoto(editingFamily) && !editingFamily._removePhoto) ? (
+                                                <FamilyPhoto
+                                                    family={editingFamily}
+                                                    alt="Family"
+                                                    className="w-24 h-24 rounded-full object-cover"
+                                                    placeholderClassName="w-24 h-24 rounded-full bg-gray-200 flex items-center justify-center text-3xl animate-pulse"
+                                                    fallback="📷"
+                                                />
                                             ) : (
                                                 <div className="w-24 h-24 rounded-full bg-gray-200 flex items-center justify-center text-3xl">📷</div>
                                             )}
@@ -1763,9 +2088,9 @@
                                                 >
                                                     📸 Upload
                                                 </button>
-                                                {editingFamily.photo && (
+                                                {(editingFamily._pendingPhoto || (hasPhoto(editingFamily) && !editingFamily._removePhoto)) && (
                                                     <button
-                                                        onClick={() => setEditingFamily({...editingFamily, photo: null})}
+                                                        onClick={() => setEditingFamily({...editingFamily, _pendingPhoto: null, _removePhoto: true})}
                                                         className="ml-2 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-xl font-bold text-sm"
                                                     >
                                                         🗑️
@@ -1959,8 +2284,13 @@
                                     onTouchEnd={(e) => e.stopPropagation()}
                                 >
                                     <div className="flex gap-6 mb-6">
-                                        {selectedFamily.photo && (
-                                            <img src={selectedFamily.photo} alt={selectedFamily.headOfFamily} className="w-32 h-32 rounded-full object-cover border-4 border-purple-200" />
+                                        {hasPhoto(selectedFamily) && (
+                                            <FamilyPhoto
+                                                family={selectedFamily}
+                                                className="w-32 h-32 rounded-full object-cover border-4 border-purple-200"
+                                                placeholderClassName="w-32 h-32 rounded-full bg-purple-100 border-4 border-purple-200 animate-pulse"
+                                                fallback=""
+                                            />
                                         )}
                                         <div className="flex-1">
                                             <div className="text-purple-600 text-sm font-bold">Family #{selectedFamily.familyNo}</div>
