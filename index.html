@@ -52,7 +52,7 @@
         // 🔐 ENCRYPTED GITHUB TOKEN CONFIGURATION 🔐
         // Token is encrypted with admin PIN for maximum security
         // Regular users CANNOT decrypt this (requires admin PIN)
-        const ENCRYPTED_GITHUB_TOKEN = 'rBL68pX60Iws99pFkzYASAJlPpjQy2QEyrwchgXhjHq7nXvWJFeSMYzMakryOUBSZQKjtx0qyrTLK8DbItFDBPRepdHqPXCj/Raar/+FujBJ7GDY5NQaHzUOi10UyO2Zm3KE1VGwSds04XuhOE4ozuV4vgTTwEiG0E/r1cABiLa4I289HEkeicM=';
+        const ENCRYPTED_GITHUB_TOKEN = 'eX4JQeoao/O4z7WJhuKHS0DWqjyQtkGgsGBmDtYYCHdrtUT5wkH5DoJ/f3klQI5jIxmn3AMzVNvY8BUosu3qg4cOSr1wNY2fbTD/pd1anlZJToKio26QnjIjW99GE3rUmhuxS6mhJbvaai9zUwI9eVgc2mbo0wOu6EMxVvksZLfJT9dRWfsTDN2q1A==';
         const GITHUB_REPO = 'jsam316/stmtc-directory';
         const GITHUB_BRANCH = 'main';
         const GITHUB_FILE_PATH = 'data/families.json.enc';
@@ -300,15 +300,25 @@
                 if (!this.repo) return 'no repository set';
                 return null;
             }
-            // Read-only: confirms the token can see the repository and whether it can write
-            // to it. `permissions.push` is the token's effective access, so a token missing
-            // "Contents: Read and write" shows up here before any save is attempted.
+            // Confirms the token can see the repository and whether it can WRITE to it.
+            // The repository's `permissions` field reflects the signed-in user's rights,
+            // not a fine-grained token's grants (it read push:true for a token that then
+            // got 403 on every upload), so the write check is a real one: creating a Git
+            // blob needs "Contents: write" and has no visible effect — no commit, no file,
+            // and the orphan object is garbage-collected.
             async checkAccess() {
                 if (!this.isConfigured()) throw new Error('GitHub not configured (' + this.unconfiguredReason() + ')');
-                const response = await fetch(`https://api.github.com/repos/${this.repo}`, { headers: this.headers() });
-                if (!response.ok) throw new Error(response.status === 401 ? 'Invalid token' : (response.status === 404 ? 'Repository not found (or token has no access to it)' : `HTTP ${response.status}`));
-                const data = await response.json();
-                return { fullName: data.full_name, canWrite: !!(data.permissions && data.permissions.push) };
+                const repoRes = await fetch(`https://api.github.com/repos/${this.repo}`, { headers: this.headers() });
+                if (!repoRes.ok) throw new Error(repoRes.status === 401 ? 'Invalid token' : (repoRes.status === 404 ? 'Repository not found (or token has no access to it)' : `HTTP ${repoRes.status}`));
+                const fullName = (await repoRes.json()).full_name;
+                const probe = await fetch(`https://api.github.com/repos/${this.repo}/git/blobs`, {
+                    method: 'POST',
+                    headers: this.headers({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({ content: 'write-permission probe', encoding: 'utf-8' })
+                });
+                let reason = null;
+                if (!probe.ok) reason = (await probe.json().catch(() => ({}))).message || `HTTP ${probe.status}`;
+                return { fullName, canWrite: probe.ok, reason };
             }
             async testConnection() {
                 if (!this.isConfigured()) throw new Error('GitHub not configured');
@@ -1367,7 +1377,7 @@
                     const result = await githubSync.checkAccess();
                     setSyncCheck({ ok: result.canWrite, text: result.canWrite
                         ? `✅ ${result.fullName}: token can read and write`
-                        : `⚠️ ${result.fullName}: token can read but NOT write — grant it "Contents: Read and write" on this repository` });
+                        : `⚠️ ${result.fullName}: token can read but NOT write (${result.reason}). In the token's settings, set Repository access to "Only select repositories" including this one, and Contents to "Read and write".` });
                 } catch (error) {
                     setSyncCheck({ ok: false, text: '❌ ' + error.message });
                 }
