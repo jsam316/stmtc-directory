@@ -139,11 +139,15 @@
                 } catch (error) {}
                 return text.trim();
             }
+            // Always the freshest copy: GitHub Pages lets browsers and its CDN cache for
+            // 10 minutes, so an unlock right after a save could load the previous data and
+            // the next save would publish that stale copy over the newer one. A unique
+            // query string is never served from either cache.
             async loadEncryptedFile() {
                 const paths = ['data/families.json.enc', './data/families.json.enc', 'families.json.enc', './families.json.enc'];
                 for (const path of paths) {
                     try {
-                        const response = await fetch(path);
+                        const response = await fetch(`${path}?t=${Date.now()}`, { cache: 'no-store' });
                         if (response.ok) return await response.text();
                     } catch (error) {}
                 }
@@ -737,6 +741,28 @@
             const [githubToken, setGithubToken] = useState('');
             const [githubRepo, setGithubRepo] = useState('');
             const [syncCheck, setSyncCheck] = useState(null);
+
+            // Which copy of the app is running. The build id is a fingerprint of this
+            // page's own script, so it changes with every deploy and needs no manual
+            // bumping; "deployed" is the page's Last-Modified time from the host. Together
+            // they answer "is this phone still on the cached old version?" at a glance.
+            const [buildId, setBuildId] = useState('…');
+            useEffect(() => {
+                (async () => {
+                    try {
+                        const src = document.querySelector('script[type="text/babel"]').textContent;
+                        const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(src));
+                        setBuildId(Array.from(new Uint8Array(hash)).slice(0, 4).map(b => b.toString(16).padStart(2, '0')).join(''));
+                    } catch (e) { setBuildId('unknown'); }
+                })();
+            }, []);
+            const deployedAt = useMemo(() => {
+                const d = new Date(document.lastModified);
+                return isNaN(d) ? '' : d.toLocaleString();
+            }, []);
+            // Bypass the cached copy of the page (GitHub Pages allows 10 minutes; iOS Safari
+            // has no hard-refresh). A changed URL is never served from cache.
+            const reloadApp = () => { window.location.replace(window.location.pathname + '?r=' + Date.now()); };
             const [newPin, setNewPin] = useState('');
             const [confirmPin, setConfirmPin] = useState('');
             const [showPhotoIngestion, setShowPhotoIngestion] = useState(false);
@@ -748,6 +774,7 @@
             const fileInputRef = useRef(null);
             const bulkPhotoInputRef = useRef(null);
             const pdfInputRef = useRef(null);
+            const busyRef = useRef(false); // a save or migration is in flight
 
             useEffect(() => {
                 let cancelled = false;
@@ -843,6 +870,11 @@
             const inlinePhotoCount = useMemo(() => families.filter(f => f.photo).length, [families]);
             const migratePhotosToFiles = async () => {
                 if (!githubSync.isConfigured() || !password) { alert('GitHub sync must be available (log in as admin) to migrate photos.'); return; }
+                if (busyRef.current) return;
+                busyRef.current = true;
+                try { await migratePhotosNow(); } finally { busyRef.current = false; }
+            };
+            const migratePhotosNow = async () => {
                 const todo = families.map((f, i) => f.photo ? i : -1).filter(i => i >= 0);
                 if (todo.length === 0) { alert('No inline photos to migrate.'); return; }
                 if (!confirm(`Move ${todo.length} photo(s) into encrypted files?\n\nEach photo becomes one commit; this may take a minute.`)) return;
@@ -1309,6 +1341,13 @@
 
             const handleSaveFamily = async () => {
                 if (!editingFamily.headOfFamily) { alert('Please enter head of family name'); return; }
+                // A second tap while the first save is still uploading would run the whole
+                // flow again and publish duplicate commits.
+                if (busyRef.current) return;
+                busyRef.current = true;
+                try { await saveFamilyNow(); } finally { busyRef.current = false; }
+            };
+            const saveFamilyNow = async () => {
                 setSyncStatus('💾 Saving...');
 
                 // Resolve the photo first: upload a new one to its encrypted file, or drop it.
@@ -1696,6 +1735,13 @@
                             </div>
                         )}
 
+                        {/* Build footer: visible to everyone, so "which version is this?" and
+                            a cache-bypassing reload never require admin access. */}
+                        <div className="mt-8 text-center text-white/60 text-xs" data-testid="build-footer">
+                            St Thomas MTC Directory · build <code className="text-white/80">{buildId}</code>{deployedAt && ` · deployed ${deployedAt}`} ·{' '}
+                            <button onClick={reloadApp} className="underline hover:text-white" title="Reload, bypassing the cached copy">reload app</button>
+                        </div>
+
                         {/* Photo Ingestion Modal */}
                         {showPhotoIngestion && (
                             <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
@@ -2059,6 +2105,10 @@
                                         <div><strong>Last sync:</strong> {githubSync.lastSync
                                             ? `${githubSync.lastSync.ok ? '✅' : '❌'} ${githubSync.lastSync.message} (${githubSync.lastSync.at.toLocaleTimeString()})`
                                             : 'none this session'}</div>
+                                        <div className="flex items-center justify-between gap-2 pt-1">
+                                            <span data-testid="app-build"><strong>App version:</strong> build <code className="bg-gray-100 px-1 rounded">{buildId}</code>{deployedAt && ` · deployed ${deployedAt}`}</span>
+                                            <button onClick={reloadApp} className="bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-1 rounded-lg font-bold text-xs whitespace-nowrap" title="Reload, bypassing the cached copy">🔃 Reload app</button>
+                                        </div>
                                         {syncCheck && (
                                             <div className={'mt-2 font-semibold ' + (syncCheck.pending ? 'text-gray-500' : (syncCheck.ok ? 'text-green-700' : 'text-red-700'))}>
                                                 {syncCheck.pending ? 'Checking…' : syncCheck.text}
