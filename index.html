@@ -331,44 +331,60 @@
             headers(extra = {}) {
                 return { 'Authorization': `token ${this.token}`, 'Accept': 'application/vnd.github.v3+json', ...extra };
             }
+            // Current blob sha of a file, or null if it does not exist. Never served from
+            // the browser cache: the API allows 60s of caching, and a save made within a
+            // minute of the previous one was sent with the old sha and rejected by GitHub
+            // ("<path> does not match <sha>"), or with no sha at all for a file that had
+            // just been created.
             async getFileSHA(path = this.filePath) {
                 try {
-                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}?ref=${this.branch}`, { headers: this.headers() });
+                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}?ref=${this.branch}&t=${Date.now()}`, { headers: this.headers(), cache: 'no-store' });
                     if (response.ok) return (await response.json()).sha;
                     return null;
                 } catch (error) { return null; }
             }
+            isShaConflict(status, message) {
+                return status === 409 || status === 422 && /sha/i.test(message || '');
+            }
             // Create or update one file; `textContent` is written verbatim as the file body.
+            // A sha conflict (someone or something else wrote the file first, or the sha
+            // lookup was stale) is retried once with a freshly fetched sha.
             async uploadFile(path, textContent, commitMessage) {
                 if (!this.isConfigured()) throw new Error('GitHub not configured');
-                const sha = await this.getFileSHA(path);
-                const body = { message: commitMessage, content: btoa(textContent), branch: this.branch };
-                if (sha) body.sha = sha;
-                const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
-                    method: 'PUT',
-                    headers: this.headers({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify(body)
-                });
-                if (!response.ok) {
+                const content = btoa(textContent);
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const sha = await this.getFileSHA(path);
+                    const body = { message: commitMessage, content, branch: this.branch };
+                    if (sha) body.sha = sha;
+                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
+                        method: 'PUT',
+                        headers: this.headers({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify(body)
+                    });
+                    if (response.ok) return await response.json();
                     const error = await response.json().catch(() => ({}));
-                    throw new Error(error.message || 'Upload failed');
+                    if (attempt === 0 && this.isShaConflict(response.status, error.message)) {
+                        console.warn(`Sha conflict on ${path}, retrying with a fresh sha:`, error.message);
+                        continue;
+                    }
+                    throw new Error(error.message || `Upload failed (HTTP ${response.status})`);
                 }
-                return await response.json();
             }
             async deleteFile(path, commitMessage) {
                 if (!this.isConfigured()) throw new Error('GitHub not configured');
-                const sha = await this.getFileSHA(path);
-                if (!sha) return null; // already gone
-                const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
-                    method: 'DELETE',
-                    headers: this.headers({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify({ message: commitMessage, sha, branch: this.branch })
-                });
-                if (!response.ok) {
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const sha = await this.getFileSHA(path);
+                    if (!sha) return null; // already gone
+                    const response = await fetch(`https://api.github.com/repos/${this.repo}/contents/${path}`, {
+                        method: 'DELETE',
+                        headers: this.headers({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify({ message: commitMessage, sha, branch: this.branch })
+                    });
+                    if (response.ok) return await response.json();
                     const error = await response.json().catch(() => ({}));
-                    throw new Error(error.message || 'Delete failed');
+                    if (attempt === 0 && this.isShaConflict(response.status, error.message)) continue;
+                    throw new Error(error.message || `Delete failed (HTTP ${response.status})`);
                 }
-                return await response.json();
             }
             async uploadData(encryptedData, commitMessage = null) {
                 if (!commitMessage) {
@@ -806,7 +822,7 @@
                     } catch (error) {
                         console.error('Photo upload failed for', key, error);
                         fam.photo = dataUrl;
-                        return { family: fam, mode: 'fallback' };
+                        return { family: fam, mode: 'fallback', error: error.message || String(error) };
                     }
                 }
                 fam.photo = dataUrl;
@@ -831,15 +847,21 @@
                 if (todo.length === 0) { alert('No inline photos to migrate.'); return; }
                 if (!confirm(`Move ${todo.length} photo(s) into encrypted files?\n\nEach photo becomes one commit; this may take a minute.`)) return;
                 const updated = [...families];
-                let moved = 0, failed = 0;
+                let moved = 0, failed = 0, firstError = null;
                 for (let n = 0; n < todo.length; n++) {
                     const i = todo[n];
                     setSyncStatus(`📦 Migrating photo ${n + 1} of ${todo.length}...`);
-                    const { family, mode } = await attachPhoto(updated[i], updated[i].photo);
-                    if (mode === 'file') { updated[i] = family; moved++; } else { failed++; }
+                    const { family, mode, error } = await attachPhoto(updated[i], updated[i].photo);
+                    if (mode === 'file') { updated[i] = family; moved++; } else { failed++; if (!firstError) firstError = `#${updated[i].familyNo}: ${error || mode}`; }
+                }
+                // Nothing moved: keep the JSON as it is rather than publishing a no-op commit.
+                if (moved === 0) {
+                    setSyncStatus(`📦 No photos migrated — ${failed} failed (${firstError})`);
+                    setTimeout(() => setSyncStatus(''), 8000);
+                    return;
                 }
                 const result = await persistFamilies(updated, `Migrate ${moved} photos to encrypted files`);
-                setSyncStatus(`📦 Migrated ${moved} photo(s)${failed ? `, ${failed} failed` : ''} — ${result.text}`);
+                setSyncStatus(`📦 Migrated ${moved} photo(s)${failed ? `, ${failed} failed (${firstError})` : ''} — ${result.text}`);
                 setTimeout(() => setSyncStatus(''), 6000);
                 setShowSettings(false);
             };
