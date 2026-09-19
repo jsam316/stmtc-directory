@@ -736,7 +736,27 @@
             const [editingFamily, setEditingFamily] = useState(null);
             const [editingMemberIndex, setEditingMemberIndex] = useState(null);
             const [editingFamilyIndex, setEditingFamilyIndex] = useState(-1);
-            const [syncStatus, setSyncStatus] = useState('');
+            const [syncStatus, setRawStatus] = useState('');
+            // A failure stays on screen until dismissed. Statuses used to clear themselves
+            // after a few seconds, so a failed migration's reason was gone before it could
+            // be read or reported, and nothing else recorded it. Every status site schedules
+            // its own clear, so an earlier one (the login banner's 4s, say) could fire while
+            // a failure is showing and wipe it: an empty write is ignored while a failure is
+            // up. A new non-empty status (the next action starting) replaces it.
+            const [statusSticky, setStatusSticky] = useState(false);
+            const stickyRef = useRef(false);
+            const setSyncStatus = (text) => {
+                if (text === '' && stickyRef.current) return;
+                if (text !== '') { stickyRef.current = false; setStatusSticky(false); }
+                setRawStatus(text);
+            };
+            const dismissStatus = () => { stickyRef.current = false; setStatusSticky(false); setRawStatus(''); };
+            const reportResult = (text, failed, ttl = 5000) => {
+                setRawStatus(text);
+                stickyRef.current = !!failed;
+                setStatusSticky(!!failed);
+                if (!failed) setTimeout(() => setSyncStatus(''), ttl);
+            };
             const [loadingData, setLoadingData] = useState(false);
             const [githubToken, setGithubToken] = useState('');
             const [githubRepo, setGithubRepo] = useState('');
@@ -827,7 +847,9 @@
                 if (syncError) text += ` — ${syncError}`;
                 else if (!attempted && isAdmin) text += ` — GitHub sync off: ${githubSync.unconfiguredReason() || 'directory PIN missing'}`;
                 githubSync.lastSync = { at: new Date(), ok: published, attempted, message: syncError || (attempted ? 'ok' : 'not attempted') };
-                return { cached, published, attempted, text };
+                // "failed" = the change is not on GitHub although it should be, or is nowhere.
+                const failed = (attempted && !published) || (!cached && !published);
+                return { cached, published, attempted, failed, text };
             };
 
             // Store a photo for a family. With GitHub sync available the photo goes to its own
@@ -848,6 +870,7 @@
                         return { family: fam, mode: 'file' };
                     } catch (error) {
                         console.error('Photo upload failed for', key, error);
+                        githubSync.lastSync = { at: new Date(), ok: false, attempted: true, message: `photo ${key} upload: ${error.message || error}` };
                         fam.photo = dataUrl;
                         return { family: fam, mode: 'fallback', error: error.message || String(error) };
                     }
@@ -888,13 +911,12 @@
                 }
                 // Nothing moved: keep the JSON as it is rather than publishing a no-op commit.
                 if (moved === 0) {
-                    setSyncStatus(`📦 No photos migrated — ${failed} failed (${firstError})`);
-                    setTimeout(() => setSyncStatus(''), 8000);
+                    githubSync.lastSync = { at: new Date(), ok: false, attempted: true, message: `migration: ${firstError}` };
+                    reportResult(`📦 No photos migrated — ${failed} failed (${firstError})`, true);
                     return;
                 }
                 const result = await persistFamilies(updated, `Migrate ${moved} photos to encrypted files`);
-                setSyncStatus(`📦 Migrated ${moved} photo(s)${failed ? `, ${failed} failed (${firstError})` : ''} — ${result.text}`);
-                setTimeout(() => setSyncStatus(''), 6000);
+                reportResult(`📦 Migrated ${moved} photo(s)${failed ? `, ${failed} failed (${firstError})` : ''} — ${result.text}`, result.failed || failed > 0, 6000);
                 setShowSettings(false);
             };
 
@@ -1082,8 +1104,7 @@
                 }
 
                 const result = await persistFamilies(updated, `Bulk photo update - ${modes.length} photos`);
-                setSyncStatus(`${modes.length} photo(s): ${describePhotoModes(modes)} — ${result.text}`);
-                setTimeout(() => setSyncStatus(''), 5000);
+                reportResult(`${modes.length} photo(s): ${describePhotoModes(modes)} — ${result.text}`, result.failed || modes.includes('fallback'));
                 setShowPhotoIngestion(false);
                 setIngestedPhotos([]);
             };
@@ -1299,8 +1320,7 @@
                 }
                 const summary = `${photoCount} photo(s)${infoCount > 0 ? ', ' + infoCount + ' info field(s)' : ''}`;
                 const result = await persistFamilies(updated, `PDF import — ${summary} updated`);
-                setSyncStatus(`${summary}${modes.length ? ' (' + describePhotoModes(modes) + ')' : ''} — ${result.text}`);
-                setTimeout(() => setSyncStatus(''), 5000);
+                reportResult(`${summary}${modes.length ? ' (' + describePhotoModes(modes) + ')' : ''} — ${result.text}`, result.failed || modes.includes('fallback'));
                 setShowPdfIngestion(false);
                 setPdfPageItems([]);
             };
@@ -1378,9 +1398,7 @@
                     updated.push(fam);
                 }
                 const result = await persistFamilies(updated);
-                setSyncStatus(result.text + photoNote);
-
-                setTimeout(() => setSyncStatus(''), 4000);
+                reportResult(result.text + photoNote, result.failed || !!photoNote, 4000);
                 setShowEditFamily(false);
                 setEditingFamily(null);
                 setEditingMemberIndex(null);
@@ -1630,8 +1648,11 @@
                                 </div>
                             </div>
                             {syncStatus && (
-                                <div className="mt-4 bg-white/20 rounded-xl p-3 text-white font-bold text-center">
-                                    {syncStatus}
+                                <div className={'mt-4 rounded-xl p-3 text-white font-bold text-center flex items-start gap-2 ' + (statusSticky ? 'bg-red-900/60 border border-red-300/60' : 'bg-white/20')} role="status" data-testid="sync-status">
+                                    <div className="flex-1 break-words">{syncStatus}</div>
+                                    {statusSticky && (
+                                        <button onClick={dismissStatus} className="text-white/80 hover:text-white text-xl leading-none" title="Dismiss" aria-label="Dismiss">×</button>
+                                    )}
                                 </div>
                             )}
                             {/* Reminder for admins while legacy inline photos remain in the JSON.
